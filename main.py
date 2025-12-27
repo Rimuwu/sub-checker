@@ -437,6 +437,22 @@ def start_local_http_server(file_path):
             # suppress noisy logs
             pass
 
+        def copyfile(self, source, outputfile):
+            """Override to avoid noisy tracebacks when client disconnects while
+            serving large files (catch BrokenPipeError/ConnectionResetError).
+            """
+            try:
+                shutil.copyfileobj(source, outputfile)
+            except (BrokenPipeError, ConnectionResetError):
+                # client closed connection early — ignore quietly
+                return
+            except OSError:
+                # other socket/OS errors — ignore to avoid noisy logs
+                return
+            except Exception:
+                # fallback: ignore any unexpected errors during file copy
+                return
+
     httpd = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Handler)
     port = httpd.server_address[1]
     url = f'http://127.0.0.1:{port}/{filename}'
