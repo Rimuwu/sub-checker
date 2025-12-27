@@ -308,38 +308,55 @@ def http_download_test(url, proxy=None, duration=10, concurrency=1, chunk_size=6
     if proxy:
         proxies = {'http': proxy, 'https': proxy}
 
+    errors_total = 0
+    status_counts_total = {}
+
     def worker():
-        nonlocal total_bytes, peak
+        nonlocal total_bytes, peak, errors_total
         session = requests.Session()
         if proxies:
             session.proxies.update(proxies)
-        try:
-            r = session.get(url, stream=True, timeout=10)
-            start = time.time()
-            bytes_read = 0
-            window_start = start
-            window_bytes = 0
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                if not chunk:
-                    break
-                now = time.time()
-                bytes_read += len(chunk)
-                window_bytes += len(chunk)
-                if now - window_start >= 0.5:
-                    bw = window_bytes / (now - window_start)
-                    with lock:
-                        if bw > peak:
-                            peak = bw
-                        total_bytes += window_bytes
-                    window_start = now
-                    window_bytes = 0
-                if now >= stop_time:
-                    break
-            # add leftover
-            with lock:
-                total_bytes += window_bytes
-        except Exception:
-            pass
+        errors = 0
+        status_counts = {}
+        window_bytes = 0
+        window_start = time.time()
+        while time.time() < stop_time:
+            try:
+                r = session.get(url, stream=True, timeout=10)
+                status_counts[r.status_code] = status_counts.get(r.status_code, 0) + 1
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        break
+                    now = time.time()
+                    l = len(chunk)
+                    window_bytes += l
+                    # every half-second update peak and total
+                    if now - window_start >= 0.5:
+                        bw = window_bytes / (now - window_start)
+                        with lock:
+                            if bw > peak:
+                                peak = bw
+                            total_bytes += window_bytes
+                        window_start = now
+                        window_bytes = 0
+                    if now >= stop_time:
+                        break
+                # leftover
+                with lock:
+                    total_bytes += window_bytes
+                window_bytes = 0
+            except Exception:
+                errors += 1
+                # small backoff
+                time.sleep(0.2)
+                continue
+        # aggregate diagnostics
+        with lock:
+            errors_total += errors
+            for k, v in status_counts.items():
+                status_counts_total[k] = status_counts_total.get(k, 0) + v
+        # function ends; no return value
+
 
     threads = []
     for _ in range(max(1, concurrency)):
@@ -351,7 +368,7 @@ def http_download_test(url, proxy=None, duration=10, concurrency=1, chunk_size=6
 
     actual_duration = duration
     avg_bps = (total_bytes / actual_duration) if actual_duration > 0 else 0
-    return {'total_bytes': total_bytes, 'duration': actual_duration, 'avg_bps': avg_bps, 'peak_bps': peak}
+    return {'total_bytes': total_bytes, 'duration': actual_duration, 'avg_bps': avg_bps, 'peak_bps': peak, 'errors': errors_total, 'status_codes': status_counts_total}
 
 
 def udp_game_test(target_host, target_port, duration=5, psize=60, interval_ms=20, expect_echo=False):
@@ -400,6 +417,41 @@ def get_free_port():
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+# Simple local HTTP server for speed tests
+def start_local_http_server(file_path):
+    """Start a small HTTP server serving the directory of file_path. Returns (server, url)"""
+    import http.server
+    import socketserver
+
+    file_path = os.path.abspath(file_path)
+    directory = os.path.dirname(file_path)
+    filename = os.path.basename(file_path)
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=directory, **kwargs)
+
+        def log_message(self, format, *args):
+            # suppress noisy logs
+            pass
+
+    httpd = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Handler)
+    port = httpd.server_address[1]
+    url = f'http://127.0.0.1:{port}/{filename}'
+
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd, url
+
+
+def stop_local_http_server(httpd):
+    try:
+        httpd.shutdown()
+        httpd.server_close()
+    except Exception:
+        pass
 
 
 def run_xray_for_node(node, xray_path='xray', start_timeout=5):
@@ -502,7 +554,7 @@ def stop_xray(x):
         pass
 
 
-def test_nodes(nodes, timeout=5, workers=10, ping_count=4, tcp_retries=6, tcp_timeout=3, do_speed=False, speed_url=None, speed_duration=10, speed_concurrency=1, speed_requests=None, do_game=False, udp_target=None, game_duration=5, game_psize=60, game_interval_ms=20, expect_echo=False, start_xray=False, xray_path='xray', show_progress=True):
+def test_nodes(nodes, timeout=5, workers=10, ping_count=4, tcp_retries=6, tcp_timeout=3, do_speed=False, speed_url=None, speed_duration=10, speed_concurrency=1, speed_requests=None, do_game=False, udp_target=None, game_duration=5, game_psize=60, game_interval_ms=20, expect_echo=False, start_xray=False, xray_path='xray', show_progress=True, on_node_complete=None):
     results = []
 
     def worker(node):
@@ -600,7 +652,13 @@ def test_nodes(nodes, timeout=5, workers=10, ping_count=4, tcp_retries=6, tcp_ti
         futures = [ex.submit(worker, n) for n in nodes]
         for f in as_completed(futures):
             try:
-                results.append(f.result())
+                r = f.result()
+                results.append(r)
+                if on_node_complete:
+                    try:
+                        on_node_complete(r)
+                    except Exception:
+                        pass
             except Exception:
                 pass
             if pbar:
@@ -703,10 +761,13 @@ def main():
     parser.add_argument('--no-progress', action='store_true', help='Disable progress bar output')
     parser.add_argument('--start-xray', action='store_true', help='Start xray locally and proxy tests through it (requires --xray-path)')
     parser.add_argument('--xray-path', default='xray', help='Path to xray binary')
-    parser.add_argument('--html-output', help='Generate HTML report (path)', default=None)
+    parser.add_argument('--html-output', help='Generate HTML report (path). If a filename only is passed, it will be written into --reports-dir', default=None)
     parser.add_argument('--reports-dir', default='reports', help='Directory to save timestamped reports when --html-output is not provided')
     parser.add_argument('--open-report', action='store_true', help='Open generated HTML report in the default browser')
     parser.add_argument('--no-html', action='store_true', help='Do not generate an HTML report')
+    parser.add_argument('--serve-speed-size', type=int, default=0, help='Create local file of given MB and serve it for speed tests')
+    parser.add_argument('--speed-file', help='Path to a local file to serve for speed tests (overrides --speed-url)')
+    parser.add_argument('--no-summary', action='store_true', help='Do not print overall progress summary')
     args = parser.parse_args()
 
     text = ''
@@ -722,6 +783,59 @@ def main():
 
     nodes = gather_nodes_from_text(text)
     print(f'Found {len(nodes)} nodes')
+
+    # prepare local speed server if requested
+    local_server = None
+    served_temp = None
+    if args.serve_speed_size and args.serve_speed_size > 0:
+        # create temp file of specified MB
+        tmpd = tempfile.mkdtemp(prefix='speed-file-')
+        fname = f'speed_{args.serve_speed_size}MB.bin'
+        fpath = os.path.join(tmpd, fname)
+        mb = 1024 * 1024
+        with open(fpath, 'wb') as fh:
+            chunk = b'\0' * (1024 * 1024)
+            for i in range(args.serve_speed_size):
+                fh.write(chunk)
+        httpd, url = start_local_http_server(fpath)
+        local_server = httpd
+        served_temp = tmpd
+        print(f'Serving local speed file at {url}')
+        args.speed_url = url
+    elif args.speed_file:
+        if os.path.exists(args.speed_file):
+            httpd, url = start_local_http_server(args.speed_file)
+            local_server = httpd
+            served_temp = None
+            print(f'Serving provided file at {url}')
+            args.speed_url = url
+        else:
+            print('Specified --speed-file does not exist, falling back to --speed-url')
+
+    # overall progress monitoring
+    total = len(nodes)
+    completed = {'count': 0}
+    lock = threading.Lock()
+
+    def on_node(r):
+        with lock:
+            completed['count'] += 1
+
+    monitor_thread = None
+    stop_monitor = {'stop': False}
+    def monitor():
+        while not stop_monitor['stop']:
+            with lock:
+                c = completed['count']
+            print(f'Progress: {c}/{total}', end='\r', flush=True)
+            if c >= total:
+                break
+            time.sleep(1)
+        print()  # newline at the end
+
+    if not args.no_summary:
+        monitor_thread = threading.Thread(target=monitor, daemon=True)
+        monitor_thread.start()
 
     # run tests
     tested = test_nodes(
@@ -744,16 +858,52 @@ def main():
         start_xray=args.start_xray,
         xray_path=args.xray_path,
         show_progress=not args.no_progress,
+        on_node_complete=on_node,
     )
+
+    stop_monitor['stop'] = True
+    if monitor_thread:
+        monitor_thread.join(timeout=2)
+
+    # stop local server if we started
+    if local_server:
+        stop_local_http_server(local_server)
+        if served_temp:
+            try:
+                shutil.rmtree(served_temp)
+            except Exception:
+                pass
+
+    # quick diagnostics for speed test results
+    if args.do_speed:
+        for n in tested:
+            sp = n.get('speed')
+            if not sp:
+                print(f"Warning: speed test missing for node {n.get('ps') or n.get('raw')[:30]}")
+                continue
+            if sp.get('avg_bps', 0) == 0:
+                errs = sp.get('errors', 0)
+                sc = sp.get('status_codes', {})
+                msg = f"Node {n.get('ps') or n.get('raw')[:30]}: speed=0 B/s"
+                if errs:
+                    msg += f" ({errs} request errors)"
+                if sc:
+                    msg += f" status_codes={sc}"
+                msg += ". Try using --serve-speed-size to host a local file or increase --speed-concurrency and --speed-duration for longer test."
+                print(msg)
 
     # generate html report unless disabled
     if not args.no_html:
         # determine html output path
+        reports_dir = Path(args.reports_dir)
+        reports_dir.mkdir(parents=True, exist_ok=True)
         if args.html_output:
-            html_path = args.html_output
+            p = Path(args.html_output)
+            if p.parent == Path('.') or str(p.parent) == '':
+                html_path = str(reports_dir / p.name)
+            else:
+                html_path = str(p)
         else:
-            reports_dir = Path(args.reports_dir)
-            reports_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
             html_path = str(reports_dir / f"report-{ts}.html")
         try:
@@ -770,9 +920,34 @@ def main():
 
     # write results (include report path if available)
     report_path = locals().get('abs_path', None)
-    meta = {'generated_at': datetime.utcnow().isoformat(), 'report': report_path, 'nodes': tested}
-    with open(args.output, 'w', encoding='utf-8') as fo:
-        json.dump(meta, fo, ensure_ascii=False, indent=2)
+    if args.detailed:
+        meta = {'generated_at': datetime.utcnow().isoformat(), 'report': report_path, 'nodes': tested}
+        with open(args.output, 'w', encoding='utf-8') as fo:
+            json.dump(meta, fo, ensure_ascii=False, indent=2)
+    else:
+        # simplified summary
+        summary = []
+        for n in tested:
+            tcp = n.get('tcp') or {}
+            ping = n.get('ping') or {}
+            speed = n.get('speed') or {}
+            game = n.get('game') or {}
+            summary.append({
+                'ps': n.get('ps'),
+                'add': n.get('add'),
+                'port': n.get('port'),
+                'reachable': n.get('reachable'),
+                'tcp_successes': tcp.get('successes'),
+                'tcp_attempts': tcp.get('attempts'),
+                'tcp_loss_percent': tcp.get('loss_percent'),
+                'tcp_p95_ms': tcp.get('p95'),
+                'ping_loss_percent': ping.get('loss_percent'),
+                'avg_speed_bps': speed.get('avg_bps'),
+                'pps': game.get('pps'),
+            })
+        out = {'generated_at': datetime.utcnow().isoformat(), 'report': report_path, 'nodes': summary}
+        with open(args.output, 'w', encoding='utf-8') as fo:
+            json.dump(out, fo, ensure_ascii=False, indent=2)
 
     # print summary table
     for n in tested:
