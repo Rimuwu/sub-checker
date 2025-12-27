@@ -34,8 +34,3 @@ SERVE_SPEED_SIZE=20 ./run_speed.sh "https://example.com/sub" speed_out.json
 - Скрипты используют `python` из PATH, можно задать `PYTHON` переменную окружения для явного интерпретатора, например `PYTHON=python3`.
 - На Windows используйте Git Bash, WSL или адаптируйте команды под PowerShell (скрипты написаны как POSIX bash).
 - Сделайте скрипты исполняемыми: `chmod +x *.sh` (если требуется).
-
-Если хотите, могу:
-- добавить Windows PowerShell версии скриптов,
-- добавить опцию выбора профиля (preset) с конфигами заранее,
-- или запустить smoke-тест (если есть пример url).
